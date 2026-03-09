@@ -31,9 +31,8 @@ class Profile(StatesGroup):
     waiting_for_mode = State()
 
 class Solving(StatesGroup):
-    waiting_for_task = State()          # Ожидаем задачу
-    step_by_step = State()               # Пошаговый режим (храним задачу и текущий шаг)
-    waiting_for_choice = State()         # После подсказки ждём выбора (след шаг / ответ)
+    waiting_for_task = State()
+    step_by_step = State()
 
 # ================== РАБОТА С JSON ==================
 DATA_FILE = "users_data.json"
@@ -84,24 +83,19 @@ async def get_gigachat_token() -> str:
                 print(f"❌ Ошибка получения токена: {resp.status} - {text}")
                 raise Exception(f"Ошибка получения токена: {resp.status} - {text}")
             json_resp = await resp.json()
-            print(f"📦 Ответ от OAuth: {json_resp}")  # отладка
+            print(f"📦 Ответ от OAuth: {json_resp}")
 
     _giga_token = json_resp["access_token"]
 
-    # Определяем expires_at
     if "expires_at" in json_resp:
         expires_at_val = json_resp["expires_at"]
         try:
             if isinstance(expires_at_val, (int, float)):
-                # Если число, это может быть timestamp в секундах или миллисекундах
-                # Проверим порядок: если число > 1e10, вероятно миллисекунды
                 if expires_at_val > 1e10:
-                    # миллисекунды -> секунды
                     expires_at_val = expires_at_val / 1000.0
                 _token_expires_at = datetime.fromtimestamp(expires_at_val, tz=timezone.utc)
                 print(f"✅ Токен истекает (timestamp): {_token_expires_at}")
             else:
-                # Строка ISO
                 expires_at_str = expires_at_val.replace('Z', '+00:00')
                 _token_expires_at = datetime.fromisoformat(expires_at_str)
                 print(f"✅ Токен истекает (ISO): {_token_expires_at}")
@@ -119,7 +113,6 @@ async def get_gigachat_token() -> str:
     return _giga_token
 
 async def query_gigachat(prompt: str, system_prompt: str = None) -> str:
-    """Отправляет запрос в GigaChat. Можно передать system_prompt для настройки режима."""
     try:
         token = await get_gigachat_token()
         print(f"✅ Токен GigaChat получен, отправляю запрос...")
@@ -154,6 +147,9 @@ async def query_gigachat(prompt: str, system_prompt: str = None) -> str:
                 if resp.status != 200:
                     text = await resp.text()
                     print(f"❌ Ошибка GigaChat: {resp.status} - {text}")
+                    # Возвращаем пользователю понятное сообщение
+                    if resp.status == 500:
+                        return "❌ Внутренняя ошибка сервера GigaChat. Попробуй позже."
                     return f"❌ Ошибка GigaChat: {resp.status} - {text}"
                 data = await resp.json()
                 try:
@@ -166,6 +162,11 @@ async def query_gigachat(prompt: str, system_prompt: str = None) -> str:
         except Exception as e:
             print(f"❌ Исключение при запросе к GigaChat: {e}")
             return f"❌ Ошибка соединения: {str(e)}"
+
+async def extract_topic(task: str) -> str:
+    prompt = f"Определи тему этой задачи одним-двумя словами. Ответь только темой, без пояснений. Задача: {task}"
+    topic = await query_gigachat(prompt, "Ты помощник, который выделяет тему задачи.")
+    return topic.strip()[:50]
 
 # ================== РЕЖИМЫ ОБЪЯСНЕНИЯ ==================
 def get_system_prompt(mode: str) -> str:
@@ -219,7 +220,6 @@ def update_user_data(user_id: int, **kwargs):
     print(f"💾 Данные пользователя {user_id} обновлены: {kwargs}")
 
 def update_topic_stats(user_id: int, topic: str, errors: int = 0, time_spent: int = 0):
-    """Обновляет статистику по теме."""
     data = load_data()
     uid = str(user_id)
     if uid not in data:
@@ -239,26 +239,53 @@ def update_topic_stats(user_id: int, topic: str, errors: int = 0, time_spent: in
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     print(f"📩 /start от {message.from_user.id}")
+    await state.clear()
     await message.answer(
         "👋 Привет! Я твой персональный бот-учитель.\n"
         "Давай настроим профиль, чтобы я мог помогать эффективнее.\n\n"
         "📌 Введи свой класс (например: 7, 8, 9):"
     )
     await state.set_state(Profile.waiting_for_class)
+    print(f"🔄 Состояние после /start: {await state.get_state()}")
 
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("🤷 Нет активного действия.", reply_markup=main_menu_keyboard())
+    else:
+        await state.clear()
+        await message.answer("✅ Действие отменено. Можем начать заново.", reply_markup=main_menu_keyboard())
+    print(f"🛑 /cancel от {message.from_user.id}, состояние было {current_state}")
+
+@dp.message(Command("debug"))
+async def cmd_debug(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    user_data = get_user_data(message.from_user.id)
+    await message.answer(
+        f"🔧 *Отладка*\n"
+        f"Состояние: `{current_state}`\n"
+        f"Профиль: {user_data.get('class_num', 'не задан')} класс, {user_data.get('subject', 'не задан')}\n"
+        f"Режим: {user_data.get('explain_mode', 'standard')}",
+        parse_mode="Markdown"
+    )
+
+# ================== ОБРАБОТЧИКИ ПРОФИЛЯ ==================
 @dp.message(Profile.waiting_for_class)
 async def process_class(message: types.Message, state: FSMContext):
+    print(f"📚 process_class вызван, сообщение: {message.text}")
     class_num = message.text.strip()
     await state.update_data(class_num=class_num)
-    print(f"📚 Класс: {class_num}")
+    print(f"📚 Класс сохранён: {class_num}")
     await message.answer("📚 Теперь напиши предмет (например: математика, физика, русский):")
     await state.set_state(Profile.waiting_for_subject)
 
 @dp.message(Profile.waiting_for_subject)
 async def process_subject(message: types.Message, state: FSMContext):
+    print(f"📚 process_subject вызван, сообщение: {message.text}")
     subject = message.text.strip()
     await state.update_data(subject=subject)
-    print(f"📚 Предмет: {subject}")
+    print(f"📚 Предмет сохранён: {subject}")
     await message.answer(
         "⚙️ Выбери режим объяснения (по умолчанию Стандарт):",
         reply_markup=mode_selection_keyboard()
@@ -267,6 +294,7 @@ async def process_subject(message: types.Message, state: FSMContext):
 
 @dp.callback_query(StateFilter(Profile.waiting_for_mode))
 async def process_mode(callback: types.CallbackQuery, state: FSMContext):
+    print(f"⚙️ process_mode вызван, data: {callback.data}")
     mode_map = {
         "mode_simple": "simple",
         "mode_standard": "standard",
@@ -357,16 +385,17 @@ async def help_command(message: types.Message):
 @dp.message()
 async def handle_all_text(message: types.Message, state: FSMContext):
     print(f"📩 Универсальный обработчик: {message.text[:50]} от {message.from_user.id}")
-    # Проверяем, не находится ли пользователь в каком-либо состоянии
     current_state = await state.get_state()
+    print(f"🔄 Текущее состояние: {current_state}")
+
+    # Если состояние активно, не обрабатываем, чтобы дать шанс другим обработчикам
     if current_state is not None:
-        print(f"⚠️ Состояние активно: {current_state}, игнорируем (должен быть другой обработчик)")
+        print(f"⚠️ Состояние активно ({current_state}), пропускаем (будет обработано другим обработчиком)")
         return
 
     user_id = message.from_user.id
     user_data = get_user_data(user_id)
 
-    # Если профиль не настроен (нет класса или предмета), просим выполнить /start
     if not user_data.get("class_num") or not user_data.get("subject"):
         print(f"👤 Пользователь {user_id} без профиля")
         await message.answer(
@@ -375,13 +404,11 @@ async def handle_all_text(message: types.Message, state: FSMContext):
         )
         return
 
-    # Если профиль есть, считаем, что пользователь хочет задать вопрос
     print(f"👤 Пользователь {user_id} с профилем, переводим в режим задачи")
     await state.set_state(Solving.waiting_for_task)
-    # И сразу обрабатываем это сообщение как задачу
     await process_task(message, state)
 
-# ================== ОБРАБОТКА ЗАДАЧ (ОСНОВНАЯ) ==================
+# ================== ОБРАБОТКА ЗАДАЧ ==================
 @dp.message(Solving.waiting_for_task)
 async def process_task(message: types.Message, state: FSMContext):
     task_text = message.text
@@ -392,41 +419,31 @@ async def process_task(message: types.Message, state: FSMContext):
 
     print(f"📥 Задача от {user_id}: {task_text[:50]}... (режим: {mode})")
 
-    # Сразу отвечаем, что думаем
     await message.answer("⏳ Думаю над ответом...")
 
-    # Сохраняем задачу в историю
     if "history" not in user_data:
         user_data["history"] = []
     user_data["history"].append(task_text)
-    update_user_data(user_id, history=user_data["history"][-5:])  # храним последние 5
+    update_user_data(user_id, history=user_data["history"][-5:])
 
-    # Если режим "подсказки" - сразу переходим в пошаговый режим
-    if mode == "hints":
-        await state.update_data(task=task_text, step=1, full_answer=None)
-        # Запрашиваем у GigaChat подсказку (первый шаг)
-        prompt = f"Задача: {task_text}\nДай только одну небольшую подсказку, не раскрывая полное решение. Начни с 'Подсказка:'."
-        hint = await query_gigachat(prompt, system_prompt)
-        escaped = html.escape(hint)
-        await message.answer(
-            f"🧩 *Подсказка:*\n{escaped}\n\nВыбери действие:",
-            reply_markup=step_choice_keyboard(),
-            parse_mode="HTML"
-        )
-        await state.set_state(Solving.step_by_step)
-    else:
-        # Обычный режим: сразу полный ответ
-        answer = await query_gigachat(task_text, system_prompt)
-        escaped = html.escape(answer)
-        await message.answer(
-            f"📝 *Ответ:*\n{escaped}",
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard()
-        )
-        # Здесь можно добавить запрос на оценку сложности и обновление статистики
+    await state.update_data(task=task_text, step=1)
+    prompt = f"Задача: {task_text}\nДай только одну небольшую подсказку, не раскрывая полное решение. Начни с 'Подсказка:'."
+    hint = await query_gigachat(prompt, system_prompt)
+
+    if hint.startswith("❌"):
+        await message.answer(hint, reply_markup=main_menu_keyboard())
         await state.clear()
+        return
 
-# ================== ПОШАГОВЫЙ РЕЖИМ (ТОЛЬКО ПОДСКАЗКИ) ==================
+    escaped = html.escape(hint)
+    await message.answer(
+        f"🧩 *Подсказка:*\n{escaped}\n\nВыбери действие:",
+        reply_markup=step_choice_keyboard(),
+        parse_mode="HTML"
+    )
+    await state.set_state(Solving.step_by_step)
+
+# ================== ПОШАГОВЫЙ РЕЖИМ ==================
 @dp.callback_query(Solving.step_by_step)
 async def step_handler(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -439,9 +456,16 @@ async def step_handler(callback: types.CallbackQuery, state: FSMContext):
 
     if callback.data == "step_next":
         step += 1
-        # Запрашиваем следующий шаг решения
         prompt = f"Задача: {task}\nДай следующий шаг решения (шаг {step}). Не раскрывай сразу всё решение, только очередную часть."
         next_step = await query_gigachat(prompt, system_prompt)
+
+        if next_step.startswith("❌"):
+            await callback.message.edit_text(next_step, parse_mode="HTML")
+            await state.clear()
+            await callback.message.answer("Что делаем дальше?", reply_markup=main_menu_keyboard())
+            await callback.answer()
+            return
+
         escaped = html.escape(next_step)
         await callback.message.edit_text(
             f"🔹 *Шаг {step}:*\n{escaped}\n\nВыбери действие:",
@@ -449,23 +473,45 @@ async def step_handler(callback: types.CallbackQuery, state: FSMContext):
             parse_mode="HTML"
         )
         await state.update_data(step=step)
+
     elif callback.data == "step_full":
-        # Пользователь запросил полный ответ
         prompt = f"Задача: {task}\nНапиши полное решение."
         full = await query_gigachat(prompt, system_prompt)
+
+        if full.startswith("❌"):
+            await callback.message.edit_text(full, parse_mode="HTML")
+            await state.clear()
+            await callback.message.answer("Что делаем дальше?", reply_markup=main_menu_keyboard())
+            await callback.answer()
+            return
+
         escaped = html.escape(full)
         await callback.message.edit_text(
             f"🔓 *Полное решение:*\n{escaped}",
             parse_mode="HTML"
         )
+
+        topic = await extract_topic(task)
+        update_topic_stats(user_id, topic, errors=1, time_spent=0)
+
         await state.clear()
         await callback.message.answer("Что делаем дальше?", reply_markup=main_menu_keyboard())
-    elif callback.data == "step_new":
-        await state.clear()
-        await callback.message.answer("Хорошо, давай новую задачу. Напиши её.", reply_markup=main_menu_keyboard())
-        await state.set_state(Solving.waiting_for_task)
 
-    await callback.answer()
+    elif callback.data == "step_new":
+        # Редактируем текущее сообщение: убираем кнопки и сообщаем о переходе
+        await callback.message.edit_text(
+            "🔄 Хорошо, давай новую задачу. Напиши её.",
+            reply_markup=None
+        )
+        # Сбрасываем состояние и устанавливаем ожидание новой задачи
+        await state.clear()
+        await state.set_state(Solving.waiting_for_task)
+        # Отправляем главное меню, чтобы пользователь мог вернуться, если передумает
+        await callback.message.answer(
+            "Ты можешь написать новый вопрос, или выбрать действие из меню:",
+            reply_markup=main_menu_keyboard()
+        )
+        await callback.answer()
 
 # ================== ЗАПУСК ==================
 async def main():
@@ -473,4 +519,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())    
+    asyncio.run(main())
